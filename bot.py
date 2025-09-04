@@ -2,70 +2,150 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import calendar
 import datetime
-import csv
-import os
-
-TOKEN = "8461591249:AAFNnI20VQaXjRhTw8S5lxdLxR21OWRWBbI"
+import mysql.connector
+import threading
+import time
+from typing import Dict, Any
+from config import TOKEN, DB_CONFIG
 bot = telebot.TeleBot(TOKEN)
-
-HABITS_FILE = "habits.csv"
-STATS_FILE = "stats.csv"
 
 START_DATE = datetime.date(2025, 9, 3)
 
-user_states = {}  # хранение состояния пользователей (например, ожидание названия привычки)
+# Кэш в памяти
+class DataCache:
+    def __init__(self):
+        self.habits: Dict[str, str] = {}
+        self.stats: Dict[str, Dict[str, bool]] = {}
+        self.last_sync = 0
+        self.sync_interval = 300  # 5 минут
+        self.lock = threading.Lock()
+        
+        # Запускаем фоновую синхронизацию
+        self.sync_thread = threading.Thread(target=self._background_sync, daemon=True)
+        self.sync_thread.start()
+    
+    def _background_sync(self):
+        """Фоновая синхронизация каждые 5 минут"""
+        while True:
+            time.sleep(60)  # Проверяем каждую минуту
+            if time.time() - self.last_sync >= self.sync_interval:
+                self._sync_to_db()
+    
+    def _sync_to_db(self):
+        """Синхронизация данных с БД"""
+        try:
+            with mysql.connector.connect(**DB_CONFIG) as conn:
+                cursor = conn.cursor()
+                
+                # Синхронизация привычек
+                cursor.execute("DELETE FROM habits")
+                for habit_id, name in self.habits.items():
+                    cursor.execute(
+                        "INSERT INTO habits (id, name) VALUES (%s, %s)",
+                        (habit_id, name)
+                    )
+                
+                # Синхронизация статистики
+                cursor.execute("DELETE FROM stats")
+                for date, habits_data in self.stats.items():
+                    for habit_id, status in habits_data.items():
+                        cursor.execute(
+                            "INSERT INTO stats (date, habit_id, status) VALUES (%s, %s, %s)",
+                            (date, habit_id, 1 if status else 0)
+                        )
+                
+                conn.commit()
+                self.last_sync = time.time()
+                print(f"Синхронизация с БД завершена: {datetime.datetime.now()}")
+                
+        except Exception as e:
+            print(f"Ошибка синхронизации с БД: {e}")
+    
+    def load_from_db(self):
+        """Загрузка данных из БД в кэш"""
+        try:
+            with mysql.connector.connect(**DB_CONFIG) as conn:
+                cursor = conn.cursor()
+                
+                # Загружаем привычки
+                cursor.execute("SELECT id, name FROM habits")
+                self.habits = {str(row[0]): row[1] for row in cursor.fetchall()}
+                
+                # Загружаем статистику
+                cursor.execute("SELECT date, habit_id, status FROM stats")
+                self.stats = {}
+                for row in cursor.fetchall():
+                    date, habit_id, status = row
+                    if date not in self.stats:
+                        self.stats[date] = {}
+                    self.stats[date][str(habit_id)] = bool(status)
+                
+                print(f"Данные загружены из БД: {len(self.habits)} привычек, {len(self.stats)} дней")
+                
+        except Exception as e:
+            print(f"Ошибка загрузки из БД: {e}")
+    
+    def get_habits(self) -> Dict[str, str]:
+        """Получить привычки из кэша"""
+        with self.lock:
+            return self.habits.copy()
+    
+    def get_stats(self) -> Dict[str, Dict[str, bool]]:
+        """Получить статистику из кэша"""
+        with self.lock:
+            return {date: habits.copy() for date, habits in self.stats.items()}
+    
+    def add_habit(self, habit_id: str, name: str):
+        """Добавить привычку в кэш"""
+        with self.lock:
+            self.habits[habit_id] = name
+    
+    def update_stat(self, date: str, habit_id: str, status: bool):
+        """Обновить статус привычки в кэше"""
+        with self.lock:
+            if date not in self.stats:
+                self.stats[date] = {}
+            self.stats[date][habit_id] = status
+
+# Глобальный кэш данных
+data_cache = DataCache()
+
+# Инициализация БД
+def init_database():
+    """Создание таблиц в БД"""
+    try:
+        with mysql.connector.connect(**DB_CONFIG) as conn:
+            cursor = conn.cursor()
+            
+            # Таблица привычек
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS habits (
+                    id VARCHAR(50) PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Таблица статистики
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS stats (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    date VARCHAR(8) NOT NULL,
+                    habit_id VARCHAR(50) NOT NULL,
+                    status TINYINT(1) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY unique_date_habit (date, habit_id),
+                    FOREIGN KEY (habit_id) REFERENCES habits(id) ON DELETE CASCADE
+                )
+            """)
+            
+            conn.commit()
+            print("Таблицы БД созданы/проверены")
+            
+    except Exception as e:
+        print(f"Ошибка инициализации БД: {e}")
 
 
-# -------------------- работа с CSV --------------------
-def load_habits():
-    habits = {}
-    if not os.path.exists(HABITS_FILE):
-        return habits
-    with open(HABITS_FILE, newline='', encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            habits[row["id"]] = row["name"]
-    return habits
-
-
-def save_habits(habits):
-    with open(HABITS_FILE, "w", newline='', encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["id", "name"])
-        writer.writeheader()
-        for h_id, name in habits.items():
-            writer.writerow({"id": h_id, "name": name})
-
-
-def load_stats():
-    data = {}
-    if not os.path.exists(STATS_FILE):
-        return data
-    with open(STATS_FILE, newline='', encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            date = row["date"]
-            habit_id = row["habit_id"]
-            status = row["status"] == "1"
-            if date not in data:
-                data[date] = {}
-            data[date][habit_id] = status
-    return data
-
-
-def save_stats(data):
-    with open(STATS_FILE, "w", newline='', encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["date", "habit_id", "status"])
-        writer.writeheader()
-        for date, habits in data.items():
-            for habit_id, status in habits.items():
-                writer.writerow({
-                    "date": date,
-                    "habit_id": habit_id,
-                    "status": "1" if status else "0"
-                })
-
-
-# -------------------- streaks --------------------
 def calc_streaks(data, habits):
     results = {}
     today = datetime.date.today()
@@ -106,7 +186,6 @@ def calc_streaks(data, habits):
     return results
 
 
-# -------------------- статус для дня --------------------
 def is_week_gold(date, data, habits):
     # проверяем всю неделю: если все привычки выполнены каждый день
     monday = date - datetime.timedelta(days=date.weekday())
@@ -121,7 +200,6 @@ def is_week_gold(date, data, habits):
                 return False
     return True
 
-
 def day_status_emoji(date_str, data, habits):
     today = datetime.date.today()
     date = datetime.datetime.strptime(date_str, "%Y%m%d").date()
@@ -130,7 +208,7 @@ def day_status_emoji(date_str, data, habits):
         return ""
 
     if is_week_gold(date, data, habits):
-        return " 🟡✨"
+        return " ��✨"
 
     if date_str not in data:
         if date < today:
@@ -144,12 +222,11 @@ def day_status_emoji(date_str, data, habits):
         else:
             return ""
     elif done == len(habits):
-        return " 🟢"
+        return " ⭐"
     else:
-        return " 🟡"
+        return " 🟢"
 
 
-# -------------------- клавиатуры --------------------
 def build_calendar(year, month, data, habits):
     kb = InlineKeyboardMarkup(row_width=7)
     cal = calendar.Calendar(firstweekday=0)
@@ -182,7 +259,6 @@ def build_calendar(year, month, data, habits):
 
     return kb
 
-
 def build_day_menu(date_str, data, habits):
     kb = InlineKeyboardMarkup(row_width=1)
     habits_data = data.get(date_str, {})
@@ -193,8 +269,6 @@ def build_day_menu(date_str, data, habits):
     kb.add(InlineKeyboardButton("⬅ Назад к календарю", callback_data=f"back_{date_str[:6]}"))
     return kb
 
-
-# -------------------- тексты --------------------
 def build_main_text(data, habits):
     streaks = calc_streaks(data, habits)
     lines = ["Лучшие результаты:\n"]
@@ -207,21 +281,60 @@ def build_main_text(data, habits):
     return "\n".join(lines)
 
 
-# -------------------- хендлеры --------------------
+user_states = {}  # хранение состояния пользователей
+
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
+    """Инициализация"""
     now = datetime.date.today()
-    data = load_stats()
-    habits = load_habits()
+    data = data_cache.get_stats()
+    habits = data_cache.get_habits()
     kb = build_calendar(now.year, now.month, data, habits)
     text = build_main_text(data, habits)
     bot.send_message(message.chat.id, text, reply_markup=kb)
 
+@bot.message_handler(commands=["upload"])
+def force_upload(message):
+    """Принудительная синхронизация с БД"""
+    try:
+        data_cache._sync_to_db()
+        bot.reply_to(message, "✅ Данные успешно загружены в базу данных!")
+        
+        # Отображаем главное меню
+        now = datetime.date.today()
+        data = data_cache.get_stats()
+        habits = data_cache.get_habits()
+        kb = build_calendar(now.year, now.month, data, habits)
+        text = build_main_text(data, habits)
+        bot.send_message(message.chat.id, text, reply_markup=kb)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка загрузки: {e}")
+
+
+@bot.message_handler(commands=["reload"])
+def reload_cache(message):
+    """Перезагрузка данных из БД в кэш"""
+    try:
+        data_cache.load_from_db()
+        bot.reply_to(message, "✅ Кэш перезагружен из базы данных!")
+        
+        # Отображаем главное меню
+        now = datetime.date.today()
+        data = data_cache.get_stats()
+        habits = data_cache.get_habits()
+        kb = build_calendar(now.year, now.month, data, habits)
+        text = build_main_text(data, habits)
+        bot.send_message(message.chat.id, text, reply_markup=kb)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка перезагрузки: {e}")
+
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    data = load_stats()
-    habits = load_habits()
+    data = data_cache.get_stats()
+    habits = data_cache.get_habits()
 
     if call.data == "add_habit":
         bot.send_message(call.message.chat.id, "Отправь название новой привычки:")
@@ -236,10 +349,15 @@ def callback_handler(call):
 
     elif call.data.startswith("toggle_"):
         _, date_str, habit_id = call.data.split("_", 2)
-        if date_str not in data:
-            data[date_str] = {}
-        data[date_str][habit_id] = not data[date_str].get(habit_id, False)
-        save_stats(data)
+        # Получаем текущий статус и инвертируем его
+        current_status = data.get(date_str, {}).get(habit_id, False)
+        new_status = not current_status
+        
+        # Обновляем в кэше
+        data_cache.update_stat(date_str, habit_id, new_status)
+        
+        # Обновляем локальную копию для отображения
+        data = data_cache.get_stats()
         text = f"Статус привычек за {date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
         kb = build_day_menu(date_str, data, habits)
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
@@ -258,21 +376,30 @@ def callback_handler(call):
         text = build_main_text(data, habits)
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
     if user_states.get(message.from_user.id) == "waiting_habit":
-        habits = load_habits()
+        habits = data_cache.get_habits()
         new_id = str(len(habits) + 1)
-        habits[new_id] = message.text.strip()
-        save_habits(habits)
+        
+        # Добавляем привычку в кэш
+        data_cache.add_habit(new_id, message.text.strip())
+        
         user_states.pop(message.from_user.id)
 
-        data = load_stats()
+        data = data_cache.get_stats()
         now = datetime.date.today()
         kb = build_calendar(now.year, now.month, data, habits)
         text = build_main_text(data, habits)
         bot.send_message(message.chat.id, f"Привычка «{message.text}» добавлена!", reply_markup=kb)
 
-
-bot.polling(none_stop=True)
+# Инициализация при запуске
+if __name__ == "__main__":
+    print("Инициализация БД...")
+    init_database()
+    
+    print("Загрузка данных из БД...")
+    data_cache.load_from_db()
+    
+    print("Бот запущен!")
+    bot.polling(none_stop=True)
