@@ -266,7 +266,7 @@ def build_day_menu(date_str, data, habits):
         status = "✅" if habits_data.get(h_id, False) else ""
         cb = f"toggle_{date_str}_{h_id}"
         kb.add(InlineKeyboardButton(f"{status} {name}", callback_data=cb))
-    kb.add(InlineKeyboardButton("⬅ Назад к календарю", callback_data=f"back_{date_str[:6]}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад к календарю", callback_data=f"back_{date_str[:6]}"))
     return kb
 
 def build_main_text(data, habits):
