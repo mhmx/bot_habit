@@ -208,7 +208,7 @@ def day_status_emoji(date_str, data, habits):
         return ""
 
     if is_week_gold(date, data, habits):
-        return " ��✨"
+        return " ⭐"
 
     if date_str not in data:
         if date < today:
@@ -222,9 +222,9 @@ def day_status_emoji(date_str, data, habits):
         else:
             return ""
     elif done == len(habits):
-        return " ⭐"
-    else:
         return " 🟢"
+    else:
+        return " 🟡"
 
 
 def build_calendar(year, month, data, habits):
