@@ -56,7 +56,7 @@ class DataCache:
                 
                 conn.commit()
                 self.last_sync = time.time()
-                print(f"Синхронизация с БД завершена: {datetime.datetime.now()}")
+                print(f"Синхронизация с БД завершена: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 
         except Exception as e:
             print(f"Ошибка синхронизации с БД: {e}")
@@ -263,7 +263,7 @@ def build_day_menu(date_str, data, habits):
     kb = InlineKeyboardMarkup(row_width=1)
     habits_data = data.get(date_str, {})
     for h_id, name in habits.items():
-        status = "✅" if habits_data.get(h_id, False) else "❌"
+        status = "✅" if habits_data.get(h_id, False) else ""
         cb = f"toggle_{date_str}_{h_id}"
         kb.add(InlineKeyboardButton(f"{status} {name}", callback_data=cb))
     kb.add(InlineKeyboardButton("⬅ Назад к календарю", callback_data=f"back_{date_str[:6]}"))
