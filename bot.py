@@ -17,7 +17,7 @@ class DataCache:
         self.habits: Dict[str, str] = {}
         self.stats: Dict[str, Dict[str, bool]] = {}
         self.last_sync = 0
-        self.sync_interval = 300  # 5 минут
+        self.sync_interval = 3600  # 5 минут
         self.lock = threading.Lock()
         
         # Запускаем фоновую синхронизацию
