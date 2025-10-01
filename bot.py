@@ -1,23 +1,44 @@
+"""
+Телеграм-бот для трекинга привычек с локальным кэшем и синхронизацией в PostgreSQL.
+
+Идея:
+- Данные (привычки и статусы по датам) держим в памяти для быстрого UI.
+- Периодически синхронизируем кэш в БД (полная выгрузка снапшота).
+- Есть команды для принудительной выгрузки / перезагрузки.
+
+База данных: PostgreSQL
+- Таблица habits: перечень привычек
+- Таблица stats: ежедневные статусы; уникальность по (date, habit_id)
+"""
+
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import calendar
 import datetime
-import mysql.connector
+import psycopg2
 import threading
 import time
 from typing import Dict, Any
 from config import TOKEN, DB_CONFIG
 bot = telebot.TeleBot(TOKEN)
 
-START_DATE = datetime.date(2025, 9, 3)
+# Нижняя граница дат, которые учитываются в интерфейсе и при подсчёте серий
+START_DATE = datetime.date(2025, 9, 27)
 
 # Кэш в памяти
 class DataCache:
+    """Потокобезопасный кэш состояния бота.
+
+    Назначение:
+    - сократить обращения к БД для операций UI
+    - хранить словари привычек и дневных статусов
+    - периодически синхронизировать всё в БД (см. _background_sync)
+    """
     def __init__(self):
         self.habits: Dict[str, str] = {}
         self.stats: Dict[str, Dict[str, bool]] = {}
         self.last_sync = 0
-        self.sync_interval = 3600  # 5 минут
+        self.sync_interval = 3600  # интервал фоновой синхронизации, сек (1 час)
         self.lock = threading.Lock()
         
         # Запускаем фоновую синхронизацию
@@ -25,16 +46,25 @@ class DataCache:
         self.sync_thread.start()
     
     def _background_sync(self):
-        """Фоновая синхронизация каждые 5 минут"""
+        """Периодическая проверка: пришло ли время выгрузить кэш в БД.
+
+        Цикл «просыпается» раз в минуту, чтобы не крутиться постоянно,
+        и при достижении self.sync_interval вызывает _sync_to_db().
+        """
         while True:
             time.sleep(60)  # Проверяем каждую минуту
             if time.time() - self.last_sync >= self.sync_interval:
                 self._sync_to_db()
     
     def _sync_to_db(self):
-        """Синхронизация данных с БД"""
+        """Полная синхронизация кэша в БД (снимок текущего состояния).
+
+        Текущая стратегия простая: TRUNCATE-подобная очистка (DELETE) и полная
+        вставка из кэша. Это надёжно и прозрачно. Для больших объёмов данных
+        можно перейти на UPSERT (ON CONFLICT DO UPDATE) и частичные изменения.
+        """
         try:
-            with mysql.connector.connect(**DB_CONFIG) as conn:
+            with psycopg2.connect(**DB_CONFIG) as conn:
                 cursor = conn.cursor()
                 
                 # Синхронизация привычек
@@ -51,7 +81,7 @@ class DataCache:
                     for habit_id, status in habits_data.items():
                         cursor.execute(
                             "INSERT INTO stats (date, habit_id, status) VALUES (%s, %s, %s)",
-                            (date, habit_id, 1 if status else 0)
+                            (date, habit_id, status)
                         )
                 
                 conn.commit()
@@ -62,9 +92,9 @@ class DataCache:
             print(f"Ошибка синхронизации с БД: {e}")
     
     def load_from_db(self):
-        """Загрузка данных из БД в кэш"""
+        """Полная загрузка данных из БД в кэш (перетирает текущее состояние)."""
         try:
-            with mysql.connector.connect(**DB_CONFIG) as conn:
+            with psycopg2.connect(**DB_CONFIG) as conn:
                 cursor = conn.cursor()
                 
                 # Загружаем привычки
@@ -112,9 +142,16 @@ data_cache = DataCache()
 
 # Инициализация БД
 def init_database():
-    """Создание таблиц в БД"""
+    """Создание таблиц в БД (PostgreSQL диалект).
+
+    Схема:
+    - habits(id, name, created_at)
+    - stats(id SERIAL, date VARCHAR(8), habit_id, status BOOLEAN, created_at)
+      + CONSTRAINT unique_date_habit UNIQUE (date, habit_id)
+      + FOREIGN KEY (habit_id) REFERENCES habits(id) ON DELETE CASCADE
+    """
     try:
-        with mysql.connector.connect(**DB_CONFIG) as conn:
+        with psycopg2.connect(**DB_CONFIG) as conn:
             cursor = conn.cursor()
             
             # Таблица привычек
@@ -122,20 +159,20 @@ def init_database():
                 CREATE TABLE IF NOT EXISTS habits (
                     id VARCHAR(50) PRIMARY KEY,
                     name VARCHAR(255) NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
             # Таблица статистики
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS stats (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id SERIAL PRIMARY KEY,
                     date VARCHAR(8) NOT NULL,
                     habit_id VARCHAR(50) NOT NULL,
-                    status TINYINT(1) NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE KEY unique_date_habit (date, habit_id),
-                    FOREIGN KEY (habit_id) REFERENCES habits(id) ON DELETE CASCADE
+                    status BOOLEAN NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT unique_date_habit UNIQUE (date, habit_id),
+                    CONSTRAINT fk_stats_habit FOREIGN KEY (habit_id) REFERENCES habits(id) ON DELETE CASCADE
                 )
             """)
             
@@ -147,6 +184,12 @@ def init_database():
 
 
 def calc_streaks(data, habits):
+    """Подсчитать лучшую/текущую/прерванную серии по каждой привычке.
+
+    data: {"YYYYMMDD": {habit_id: bool}}
+    habits: {habit_id: habit_name}
+    Возвращает: {habit_name: (best, current, broken_best)}
+    """
     results = {}
     today = datetime.date.today()
 
@@ -187,6 +230,7 @@ def calc_streaks(data, habits):
 
 
 def is_week_gold(date, data, habits):
+    """Проверяет «золотую неделю»: все привычки выполнены каждый день недели."""
     # проверяем всю неделю: если все привычки выполнены каждый день
     monday = date - datetime.timedelta(days=date.weekday())
     sunday = monday + datetime.timedelta(days=6)
@@ -201,6 +245,7 @@ def is_week_gold(date, data, habits):
     return True
 
 def day_status_emoji(date_str, data, habits):
+    """Возвращает эмодзи статуса для дня (⭐/🔴/🟡/🟢)."""
     today = datetime.date.today()
     date = datetime.datetime.strptime(date_str, "%Y%m%d").date()
 
@@ -228,6 +273,7 @@ def day_status_emoji(date_str, data, habits):
 
 
 def build_calendar(year, month, data, habits):
+    """Построение инлайн-календаря с днями и навигацией по месяцам."""
     kb = InlineKeyboardMarkup(row_width=7)
     cal = calendar.Calendar(firstweekday=0)
     month_days = cal.monthdayscalendar(year, month)
@@ -260,6 +306,7 @@ def build_calendar(year, month, data, habits):
     return kb
 
 def build_day_menu(date_str, data, habits):
+    """Меню статусов привычек за день (переключение по клику)."""
     kb = InlineKeyboardMarkup(row_width=1)
     habits_data = data.get(date_str, {})
     for h_id, name in habits.items():
@@ -270,6 +317,7 @@ def build_day_menu(date_str, data, habits):
     return kb
 
 def build_main_text(data, habits):
+    """Текст главного экрана с лучшими результатами по привычкам."""
     streaks = calc_streaks(data, habits)
     lines = ["Лучшие результаты:\n"]
     for habit, (best, current, broken) in streaks.items():
@@ -285,7 +333,7 @@ user_states = {}  # хранение состояния пользователе
 
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
-    """Инициализация"""
+    """Старт: показать календарь и лучшие результаты (без обращения к БД)."""
     now = datetime.date.today()
     data = data_cache.get_stats()
     habits = data_cache.get_habits()
@@ -295,7 +343,7 @@ def send_welcome(message):
 
 @bot.message_handler(commands=["upload"])
 def force_upload(message):
-    """Принудительная синхронизация с БД"""
+    """Принудительно выгрузить кэш в БД и обновить экран."""
     try:
         data_cache._sync_to_db()
         bot.reply_to(message, "✅ Данные успешно загружены в базу данных!")
@@ -314,7 +362,7 @@ def force_upload(message):
 
 @bot.message_handler(commands=["reload"])
 def reload_cache(message):
-    """Перезагрузка данных из БД в кэш"""
+    """Полностью перезагрузить кэш из БД и обновить экран."""
     try:
         data_cache.load_from_db()
         bot.reply_to(message, "✅ Кэш перезагружен из базы данных!")
@@ -333,6 +381,7 @@ def reload_cache(message):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
+    """Обработка всех callback-кнопок календаря и меню дня."""
     data = data_cache.get_stats()
     habits = data_cache.get_habits()
 
@@ -358,7 +407,8 @@ def callback_handler(call):
         
         # Обновляем локальную копию для отображения
         data = data_cache.get_stats()
-        text = f"Статус привычек за {date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+        # Сохраняем единый формат даты dd.mm.yyyy
+        text = f"Статус привычек за {date_str[6:]}.{date_str[4:6]}.{date_str[:4]}"
         kb = build_day_menu(date_str, data, habits)
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
@@ -378,6 +428,11 @@ def callback_handler(call):
 
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
+    """Обработка текстовых сообщений.
+
+    Если ожидается название новой привычки (состояние "waiting_habit"),
+    добавляем её в кэш и показываем главный экран.
+    """
     if user_states.get(message.from_user.id) == "waiting_habit":
         habits = data_cache.get_habits()
         new_id = str(len(habits) + 1)
