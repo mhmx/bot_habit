@@ -457,4 +457,4 @@ if __name__ == "__main__":
     data_cache.load_from_db()
     
     print("Бот запущен!")
-    bot.polling(none_stop=True)
+    bot.infinity_polling()
