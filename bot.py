@@ -18,9 +18,81 @@ import datetime
 import psycopg2
 import threading
 import time
+import traceback
+import logging
+from logging.handlers import RotatingFileHandler
 from typing import Dict, Any
 from config import TOKEN, DB_CONFIG
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Вывод в консоль
+        RotatingFileHandler('bot.log', maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')  # Ротация логов
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Подавляем подробные логи от telebot для ошибки 409
+telebot_logger = logging.getLogger('telebot')
+telebot_logger.setLevel(logging.WARNING)
+
+# Фильтр для подавления повторяющихся ошибок 409
+class Error409Filter(logging.Filter):
+    def filter(self, record):
+        if hasattr(record, 'msg') and isinstance(record.msg, str):
+            if "Error code: 409" in record.msg and "Conflict: terminated by other getUpdates request" in record.msg:
+                return False
+        return True
+
+# Применяем фильтр к логгеру telebot
+telebot_logger.addFilter(Error409Filter())
+
 bot = telebot.TeleBot(TOKEN)
+
+# Кастомный обработчик исключений для telebot
+class CustomExceptionHandler:
+    """Обработчик исключений telebot для краткого вывода ошибок"""
+    def __init__(self):
+        self.error_409_count = 0
+        self.last_error_409_time = 0
+    
+    def handle(self, exception):
+        """Обработка исключения"""
+        error_msg = str(exception)
+        current_time = time.time()
+        
+        if "Error code: 409" in error_msg and "Conflict: terminated by other getUpdates request" in error_msg:
+            self.error_409_count += 1
+            # Выводим сообщение только раз в минуту
+            if current_time - self.last_error_409_time > 60:
+                logger.error(f"Ошибка 409: Запущено несколько экземпляров бота одновременно (всего ошибок: {self.error_409_count})")
+                self.last_error_409_time = current_time
+        else:
+            logger.error(f"Ошибка telebot: {error_msg}")
+        
+        return True  # Возвращаем True, чтобы telebot знал, что исключение обработано
+
+# Устанавливаем кастомный обработчик
+bot.exception_handler = CustomExceptionHandler()
+
+def error_handler(func):
+    """Декоратор для обработки ошибок в функциях бота"""
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            error_msg = str(e)
+            # Краткое сообщение для ошибки 409 (конфликт экземпляров бота)
+            if "Error code: 409" in error_msg and "Conflict: terminated by other getUpdates request" in error_msg:
+                logger.error("Ошибка 409: Запущено несколько экземпляров бота одновременно")
+            else:
+                logger.error(f"Ошибка в {func.__name__}: {error_msg}")
+                logger.error(f"Трассировка: {traceback.format_exc()}")
+            return None
+    return wrapper
 
 # Нижняя граница дат, которые учитываются в интерфейсе и при подсчёте серий
 START_DATE = datetime.date(2025, 9, 27)
@@ -52,9 +124,14 @@ class DataCache:
         и при достижении self.sync_interval вызывает _sync_to_db().
         """
         while True:
-            time.sleep(60)  # Проверяем каждую минуту
-            if time.time() - self.last_sync >= self.sync_interval:
-                self._sync_to_db()
+            try:
+                time.sleep(60)  # Проверяем каждую минуту
+                if time.time() - self.last_sync >= self.sync_interval:
+                    self._sync_to_db()
+            except Exception as e:
+                logger.error(f"Ошибка в фоновой синхронизации: {str(e)}")
+                logger.error(f"Трассировка: {traceback.format_exc()}")
+                time.sleep(60)  # Продолжаем работу даже при ошибке
     
     def _sync_to_db(self):
         """Полная синхронизация кэша в БД (снимок текущего состояния).
@@ -86,10 +163,11 @@ class DataCache:
                 
                 conn.commit()
                 self.last_sync = time.time()
-                print(f"Синхронизация с БД завершена: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info(f"Синхронизация с БД завершена: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 
         except Exception as e:
-            print(f"Ошибка синхронизации с БД: {e}")
+            logger.error(f"Ошибка синхронизации с БД: {str(e)}")
+            logger.error(f"Трассировка: {traceback.format_exc()}")
     
     def load_from_db(self):
         """Полная загрузка данных из БД в кэш (перетирает текущее состояние)."""
@@ -110,10 +188,11 @@ class DataCache:
                         self.stats[date] = {}
                     self.stats[date][str(habit_id)] = bool(status)
                 
-                print(f"Данные загружены из БД: {len(self.habits)} привычек, {len(self.stats)} дней")
+                logger.info(f"Данные загружены из БД: {len(self.habits)} привычек, {len(self.stats)} дней")
                 
         except Exception as e:
-            print(f"Ошибка загрузки из БД: {e}")
+            logger.error(f"Ошибка загрузки из БД: {str(e)}")
+            logger.error(f"Трассировка: {traceback.format_exc()}")
     
     def get_habits(self) -> Dict[str, str]:
         """Получить привычки из кэша"""
@@ -177,10 +256,11 @@ def init_database():
             """)
             
             conn.commit()
-            print("Таблицы БД созданы/проверены")
+            logger.info("Таблицы БД созданы/проверены")
             
     except Exception as e:
-        print(f"Ошибка инициализации БД: {e}")
+        logger.error(f"Ошибка инициализации БД: {str(e)}")
+        logger.error(f"Трассировка: {traceback.format_exc()}")
 
 
 def calc_streaks(data, habits):
@@ -324,7 +404,7 @@ def build_main_text(data, habits):
         if broken and broken != best:
             lines.append(f"{habit} — {best} дней (был {broken})")
         else:
-            lines.append(f"{habit} — {best} дней")
+            lines.append(f"{habit} — {best}/21 дней ({round(best/21*100)}%)")
     lines.append("\nВыбери день:")
     return "\n".join(lines)
 
@@ -332,8 +412,10 @@ def build_main_text(data, habits):
 user_states = {}  # хранение состояния пользователей
 
 @bot.message_handler(commands=["start"])
+@error_handler
 def send_welcome(message):
     """Старт: показать календарь и лучшие результаты (без обращения к БД)."""
+    logger.info(f"Пользователь {message.from_user.id} ({message.from_user.username}) запустил бота")
     now = datetime.date.today()
     data = data_cache.get_stats()
     habits = data_cache.get_habits()
@@ -342,8 +424,10 @@ def send_welcome(message):
     bot.send_message(message.chat.id, text, reply_markup=kb)
 
 @bot.message_handler(commands=["upload"])
+@error_handler
 def force_upload(message):
     """Принудительно выгрузить кэш в БД и обновить экран."""
+    logger.info(f"Пользователь {message.from_user.id} выполнил принудительную загрузку данных")
     try:
         data_cache._sync_to_db()
         bot.reply_to(message, "✅ Данные успешно загружены в базу данных!")
@@ -361,8 +445,10 @@ def force_upload(message):
 
 
 @bot.message_handler(commands=["reload"])
+@error_handler
 def reload_cache(message):
     """Полностью перезагрузить кэш из БД и обновить экран."""
+    logger.info(f"Пользователь {message.from_user.id} выполнил перезагрузку кэша")
     try:
         data_cache.load_from_db()
         bot.reply_to(message, "✅ Кэш перезагружен из базы данных!")
@@ -380,12 +466,14 @@ def reload_cache(message):
 
 
 @bot.callback_query_handler(func=lambda call: True)
+@error_handler
 def callback_handler(call):
     """Обработка всех callback-кнопок календаря и меню дня."""
     data = data_cache.get_stats()
     habits = data_cache.get_habits()
 
     if call.data == "add_habit":
+        logger.info(f"Пользователь {call.from_user.id} начал добавление новой привычки")
         bot.send_message(call.message.chat.id, "Отправь название новой привычки:")
         user_states[call.from_user.id] = "waiting_habit"
         return
@@ -401,6 +489,11 @@ def callback_handler(call):
         # Получаем текущий статус и инвертируем его
         current_status = data.get(date_str, {}).get(habit_id, False)
         new_status = not current_status
+        
+        # Логируем изменение статуса
+        habit_name = habits.get(habit_id, f"Привычка {habit_id}")
+        status_text = "выполнено" if new_status else "не выполнено"
+        logger.info(f"Пользователь {call.from_user.id} изменил статус '{habit_name}' на {date_str[6:]}.{date_str[4:6]}.{date_str[:4]} - {status_text}")
         
         # Обновляем в кэше
         data_cache.update_stat(date_str, habit_id, new_status)
@@ -427,6 +520,7 @@ def callback_handler(call):
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
 @bot.message_handler(func=lambda message: True)
+@error_handler
 def handle_text(message):
     """Обработка текстовых сообщений.
 
@@ -436,6 +530,9 @@ def handle_text(message):
     if user_states.get(message.from_user.id) == "waiting_habit":
         habits = data_cache.get_habits()
         new_id = str(len(habits) + 1)
+        
+        # Логируем добавление новой привычки
+        logger.info(f"Пользователь {message.from_user.id} добавил новую привычку: '{message.text.strip()}' (ID: {new_id})")
         
         # Добавляем привычку в кэш
         data_cache.add_habit(new_id, message.text.strip())
@@ -450,11 +547,31 @@ def handle_text(message):
 
 # Инициализация при запуске
 if __name__ == "__main__":
-    print("Инициализация БД...")
-    init_database()
-    
-    print("Загрузка данных из БД...")
-    data_cache.load_from_db()
-    
-    print("Бот запущен!")
-    bot.infinity_polling()
+    try:
+        logger.info("Инициализация БД...")
+        init_database()
+        
+        logger.info("Загрузка данных из БД...")
+        data_cache.load_from_db()
+        
+        logger.info("Бот запущен!")
+        
+        # Обработка ошибок polling с повторными попытками
+        while True:
+            try:
+                bot.infinity_polling()
+            except Exception as e:
+                error_msg = str(e)
+                if "Error code: 409" in error_msg and "Conflict: terminated by other getUpdates request" in error_msg:
+                    logger.error("Ошибка 409: Запущено несколько экземпляров бота одновременно")
+                    logger.info("Ожидание 10 секунд перед повторной попыткой...")
+                    time.sleep(10)
+                else:
+                    logger.error(f"Ошибка polling: {error_msg}")
+                    logger.error(f"Трассировка: {traceback.format_exc()}")
+                    logger.info("Ожидание 5 секунд перед повторной попыткой...")
+                    time.sleep(5)
+                    
+    except Exception as e:
+        logger.error(f"Критическая ошибка при запуске бота: {str(e)}")
+        logger.error(f"Трассировка: {traceback.format_exc()}")
