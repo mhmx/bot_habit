@@ -107,7 +107,7 @@ class DataCache:
     - периодически синхронизировать всё в БД (см. _background_sync)
     """
     def __init__(self):
-        self.habits: Dict[str, str] = {}
+        self.habits: Dict[str, Dict[str, str]] = {}  # {habit_id: {"name": str, "start_date": str}}
         self.stats: Dict[str, Dict[str, bool]] = {}
         self.last_sync = 0
         self.sync_interval = 3600  # интервал фоновой синхронизации, сек (1 час)
@@ -146,10 +146,10 @@ class DataCache:
                 
                 # Синхронизация привычек
                 cursor.execute("DELETE FROM habits")
-                for habit_id, name in self.habits.items():
+                for habit_id, habit_data in self.habits.items():
                     cursor.execute(
-                        "INSERT INTO habits (id, name) VALUES (%s, %s)",
-                        (habit_id, name)
+                        "INSERT INTO habits (id, name, start_date) VALUES (%s, %s, %s)",
+                        (habit_id, habit_data["name"], habit_data["start_date"])
                     )
                 
                 # Синхронизация статистики
@@ -176,8 +176,11 @@ class DataCache:
                 cursor = conn.cursor()
                 
                 # Загружаем привычки
-                cursor.execute("SELECT id, name FROM habits")
-                self.habits = {str(row[0]): row[1] for row in cursor.fetchall()}
+                cursor.execute("SELECT id, name, start_date FROM habits")
+                self.habits = {}
+                for row in cursor.fetchall():
+                    habit_id, name, start_date = row
+                    self.habits[str(habit_id)] = {"name": name, "start_date": start_date}
                 
                 # Загружаем статистику
                 cursor.execute("SELECT date, habit_id, status FROM stats")
@@ -195,19 +198,24 @@ class DataCache:
             logger.error(f"Трассировка: {traceback.format_exc()}")
     
     def get_habits(self) -> Dict[str, str]:
-        """Получить привычки из кэша"""
+        """Получить привычки из кэша (только имена для обратной совместимости)"""
         with self.lock:
-            return self.habits.copy()
+            return {habit_id: habit_data["name"] for habit_id, habit_data in self.habits.items()}
+    
+    def get_habits_full(self) -> Dict[str, Dict[str, str]]:
+        """Получить полную информацию о привычках из кэша"""
+        with self.lock:
+            return {habit_id: habit_data.copy() for habit_id, habit_data in self.habits.items()}
     
     def get_stats(self) -> Dict[str, Dict[str, bool]]:
         """Получить статистику из кэша"""
         with self.lock:
             return {date: habits.copy() for date, habits in self.stats.items()}
     
-    def add_habit(self, habit_id: str, name: str):
+    def add_habit(self, habit_id: str, name: str, start_date: str):
         """Добавить привычку в кэш"""
         with self.lock:
-            self.habits[habit_id] = name
+            self.habits[habit_id] = {"name": name, "start_date": start_date}
     
     def update_stat(self, date: str, habit_id: str, status: bool):
         """Обновить статус привычки в кэше"""
@@ -220,11 +228,44 @@ class DataCache:
 data_cache = DataCache()
 
 # Инициализация БД
+def migrate_database():
+    """Миграция существующих данных для добавления поля start_date."""
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            cursor = conn.cursor()
+            
+            # Проверяем, существует ли поле start_date
+            cursor.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='habits' AND column_name='start_date'
+            """)
+            
+            if not cursor.fetchone():
+                # Добавляем поле start_date
+                cursor.execute("ALTER TABLE habits ADD COLUMN start_date VARCHAR(8)")
+                
+                # Устанавливаем значение по умолчанию для существующих записей
+                cursor.execute("UPDATE habits SET start_date = '20250927' WHERE start_date IS NULL")
+                
+                # Делаем поле обязательным
+                cursor.execute("ALTER TABLE habits ALTER COLUMN start_date SET NOT NULL")
+                
+                conn.commit()
+                logger.info("Миграция БД завершена: добавлено поле start_date")
+            else:
+                logger.info("Поле start_date уже существует в таблице habits")
+                
+    except Exception as e:
+        logger.error(f"Ошибка миграции БД: {str(e)}")
+        logger.error(f"Трассировка: {traceback.format_exc()}")
+
+
 def init_database():
     """Создание таблиц в БД (PostgreSQL диалект).
 
     Схема:
-    - habits(id, name, created_at)
+    - habits(id, name, start_date, created_at)
     - stats(id SERIAL, date VARCHAR(8), habit_id, status BOOLEAN, created_at)
       + CONSTRAINT unique_date_habit UNIQUE (date, habit_id)
       + FOREIGN KEY (habit_id) REFERENCES habits(id) ON DELETE CASCADE
@@ -238,6 +279,7 @@ def init_database():
                 CREATE TABLE IF NOT EXISTS habits (
                     id VARCHAR(50) PRIMARY KEY,
                     name VARCHAR(255) NOT NULL,
+                    start_date VARCHAR(8) NOT NULL,
                     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -263,17 +305,27 @@ def init_database():
         logger.error(f"Трассировка: {traceback.format_exc()}")
 
 
-def calc_streaks(data, habits):
+def calc_streaks(data, habits_full):
     """Подсчитать лучшую/текущую/прерванную серии по каждой привычке.
 
     data: {"YYYYMMDD": {habit_id: bool}}
-    habits: {habit_id: habit_name}
+    habits_full: {habit_id: {"name": str, "start_date": str}}
     Возвращает: {habit_name: (best, current, broken_best)}
     """
     results = {}
     today = datetime.date.today()
 
-    for h_id, habit in habits.items():
+    for h_id, habit_data in habits_full.items():
+        habit_name = habit_data["name"]
+        start_date_str = habit_data["start_date"]
+        
+        # Парсим дату начала привычки
+        try:
+            habit_start_date = datetime.datetime.strptime(start_date_str, "%Y%m%d").date()
+        except ValueError:
+            # Если дата некорректная, используем START_DATE
+            habit_start_date = START_DATE
+        
         best = 0
         current = 0
         broken_best = 0
@@ -282,7 +334,8 @@ def calc_streaks(data, habits):
 
         for d in sorted(data.keys()):
             date = datetime.datetime.strptime(d, "%Y%m%d").date()
-            if date < START_DATE or date > today:
+            # Учитываем только даты после начала привычки и до сегодня
+            if date < habit_start_date or date > today:
                 continue
 
             if h_id in data[d] and data[d][h_id]:
@@ -304,12 +357,12 @@ def calc_streaks(data, habits):
         if streak > best:
             best = streak
 
-        results[habit] = (best, streak, broken_best)
+        results[habit_name] = (best, streak, broken_best)
 
     return results
 
 
-def is_week_gold(date, data, habits):
+def is_week_gold(date, data, habits_full):
     """Проверяет «золотую неделю»: все привычки выполнены каждый день недели."""
     # проверяем всю неделю: если все привычки выполнены каждый день
     monday = date - datetime.timedelta(days=date.weekday())
@@ -319,12 +372,19 @@ def is_week_gold(date, data, habits):
         d_str = d.strftime("%Y%m%d")
         if d_str not in data:
             return False
-        for h_id in habits.keys():
-            if not data[d_str].get(h_id, False):
-                return False
+        for h_id, habit_data in habits_full.items():
+            # Проверяем только привычки, которые уже начались к этому дню
+            try:
+                habit_start_date = datetime.datetime.strptime(habit_data["start_date"], "%Y%m%d").date()
+                if d >= habit_start_date and not data[d_str].get(h_id, False):
+                    return False
+            except ValueError:
+                # Если дата некорректная, используем START_DATE
+                if d >= START_DATE and not data[d_str].get(h_id, False):
+                    return False
     return True
 
-def day_status_emoji(date_str, data, habits):
+def day_status_emoji(date_str, data, habits_full):
     """Возвращает эмодзи статуса для дня (⭐/🔴/🟡/🟢)."""
     today = datetime.date.today()
     date = datetime.datetime.strptime(date_str, "%Y%m%d").date()
@@ -332,27 +392,47 @@ def day_status_emoji(date_str, data, habits):
     if date < START_DATE:
         return ""
 
-    if is_week_gold(date, data, habits):
+    if is_week_gold(date, data, habits_full):
         return " ⭐"
 
     if date_str not in data:
         if date < today:
             return " 🔴"
         return ""
+    
     habits_data = data[date_str]
-    done = sum(1 for h in habits.keys() if habits_data.get(h, False))
-    if done == 0:
+    done = 0
+    total_active = 0
+    
+    for h_id, habit_data in habits_full.items():
+        # Проверяем только привычки, которые уже начались к этому дню
+        try:
+            habit_start_date = datetime.datetime.strptime(habit_data["start_date"], "%Y%m%d").date()
+            if date >= habit_start_date:
+                total_active += 1
+                if habits_data.get(h_id, False):
+                    done += 1
+        except ValueError:
+            # Если дата некорректная, используем START_DATE
+            if date >= START_DATE:
+                total_active += 1
+                if habits_data.get(h_id, False):
+                    done += 1
+    
+    if total_active == 0:
+        return ""
+    elif done == 0:
         if date < today:
             return " 🔴"
         else:
             return ""
-    elif done == len(habits):
+    elif done == total_active:
         return " 🟢"
     else:
         return " 🟡"
 
 
-def build_calendar(year, month, data, habits):
+def build_calendar(year, month, data, habits_full):
     """Построение инлайн-календаря с днями и навигацией по месяцам."""
     kb = InlineKeyboardMarkup(row_width=7)
     cal = calendar.Calendar(firstweekday=0)
@@ -370,7 +450,7 @@ def build_calendar(year, month, data, habits):
                 row.append(InlineKeyboardButton(" ", callback_data="none"))
             else:
                 date_str = f"{year}{month:02d}{day:02d}"
-                emoji = day_status_emoji(date_str, data, habits)
+                emoji = day_status_emoji(date_str, data, habits_full)
                 cb = f"day_{date_str}"
                 row.append(InlineKeyboardButton(f"{day}{emoji}", callback_data=cb))
         kb.row(*row)
@@ -385,20 +465,34 @@ def build_calendar(year, month, data, habits):
 
     return kb
 
-def build_day_menu(date_str, data, habits):
+def build_day_menu(date_str, data, habits_full):
     """Меню статусов привычек за день (переключение по клику)."""
     kb = InlineKeyboardMarkup(row_width=1)
     habits_data = data.get(date_str, {})
-    for h_id, name in habits.items():
-        status = "✅" if habits_data.get(h_id, False) else ""
-        cb = f"toggle_{date_str}_{h_id}"
-        kb.add(InlineKeyboardButton(f"{status} {name}", callback_data=cb))
+    date = datetime.datetime.strptime(date_str, "%Y%m%d").date()
+    
+    for h_id, habit_data in habits_full.items():
+        habit_name = habit_data["name"]
+        # Проверяем только привычки, которые уже начались к этому дню
+        try:
+            habit_start_date = datetime.datetime.strptime(habit_data["start_date"], "%Y%m%d").date()
+            if date >= habit_start_date:
+                status = "✅" if habits_data.get(h_id, False) else ""
+                cb = f"toggle_{date_str}_{h_id}"
+                kb.add(InlineKeyboardButton(f"{status} {habit_name}", callback_data=cb))
+        except ValueError:
+            # Если дата некорректная, используем START_DATE
+            if date >= START_DATE:
+                status = "✅" if habits_data.get(h_id, False) else ""
+                cb = f"toggle_{date_str}_{h_id}"
+                kb.add(InlineKeyboardButton(f"{status} {habit_name}", callback_data=cb))
+    
     kb.add(InlineKeyboardButton("⬅️ Назад к календарю", callback_data=f"back_{date_str[:6]}"))
     return kb
 
-def build_main_text(data, habits):
+def build_main_text(data, habits_full):
     """Текст главного экрана с лучшими результатами по привычкам."""
-    streaks = calc_streaks(data, habits)
+    streaks = calc_streaks(data, habits_full)
     lines = ["Лучшие результаты:\n"]
     for habit, (best, current, broken) in streaks.items():
         if broken and broken != best:
@@ -418,9 +512,9 @@ def send_welcome(message):
     logger.info(f"Пользователь {message.from_user.id} ({message.from_user.username}) запустил бота")
     now = datetime.date.today()
     data = data_cache.get_stats()
-    habits = data_cache.get_habits()
-    kb = build_calendar(now.year, now.month, data, habits)
-    text = build_main_text(data, habits)
+    habits_full = data_cache.get_habits_full()
+    kb = build_calendar(now.year, now.month, data, habits_full)
+    text = build_main_text(data, habits_full)
     bot.send_message(message.chat.id, text, reply_markup=kb)
 
 @bot.message_handler(commands=["upload"])
@@ -435,9 +529,9 @@ def force_upload(message):
         # Отображаем главное меню
         now = datetime.date.today()
         data = data_cache.get_stats()
-        habits = data_cache.get_habits()
-        kb = build_calendar(now.year, now.month, data, habits)
-        text = build_main_text(data, habits)
+        habits_full = data_cache.get_habits_full()
+        kb = build_calendar(now.year, now.month, data, habits_full)
+        text = build_main_text(data, habits_full)
         bot.send_message(message.chat.id, text, reply_markup=kb)
         
     except Exception as e:
@@ -456,9 +550,9 @@ def reload_cache(message):
         # Отображаем главное меню
         now = datetime.date.today()
         data = data_cache.get_stats()
-        habits = data_cache.get_habits()
-        kb = build_calendar(now.year, now.month, data, habits)
-        text = build_main_text(data, habits)
+        habits_full = data_cache.get_habits_full()
+        kb = build_calendar(now.year, now.month, data, habits_full)
+        text = build_main_text(data, habits_full)
         bot.send_message(message.chat.id, text, reply_markup=kb)
         
     except Exception as e:
@@ -470,18 +564,18 @@ def reload_cache(message):
 def callback_handler(call):
     """Обработка всех callback-кнопок календаря и меню дня."""
     data = data_cache.get_stats()
-    habits = data_cache.get_habits()
+    habits_full = data_cache.get_habits_full()
 
     if call.data == "add_habit":
         logger.info(f"Пользователь {call.from_user.id} начал добавление новой привычки")
-        bot.send_message(call.message.chat.id, "Отправь название новой привычки:")
+        bot.send_message(call.message.chat.id, "Отправь название новой привычки в формате:\n• привычка/дата (например: Читать книги/21.09.2025)\n• или просто привычка (дата будет сегодняшняя)")
         user_states[call.from_user.id] = "waiting_habit"
         return
 
     if call.data.startswith("day_"):
         date_str = call.data.split("_")[1]
         text = f"Статус привычек за {date_str[6:]}.{date_str[4:6]}.{date_str[:4]}"
-        kb = build_day_menu(date_str, data, habits)
+        kb = build_day_menu(date_str, data, habits_full)
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
     elif call.data.startswith("toggle_"):
@@ -491,7 +585,7 @@ def callback_handler(call):
         new_status = not current_status
         
         # Логируем изменение статуса
-        habit_name = habits.get(habit_id, f"Привычка {habit_id}")
+        habit_name = habits_full.get(habit_id, {}).get("name", f"Привычка {habit_id}")
         status_text = "выполнено" if new_status else "не выполнено"
         logger.info(f"Пользователь {call.from_user.id} изменил статус '{habit_name}' на {date_str[6:]}.{date_str[4:6]}.{date_str[:4]} - {status_text}")
         
@@ -502,21 +596,21 @@ def callback_handler(call):
         data = data_cache.get_stats()
         # Сохраняем единый формат даты dd.mm.yyyy
         text = f"Статус привычек за {date_str[6:]}.{date_str[4:6]}.{date_str[:4]}"
-        kb = build_day_menu(date_str, data, habits)
+        kb = build_day_menu(date_str, data, habits_full)
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
     elif call.data.startswith("back_"):
         yyyymm = call.data.split("_")[1]
         year, month = int(yyyymm[:4]), int(yyyymm[4:])
-        kb = build_calendar(year, month, data, habits)
-        text = build_main_text(data, habits)
+        kb = build_calendar(year, month, data, habits_full)
+        text = build_main_text(data, habits_full)
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
     elif call.data.startswith("month_"):
         yyyymm = call.data.split("_")[1]
         year, month = int(yyyymm[:4]), int(yyyymm[4:])
-        kb = build_calendar(year, month, data, habits)
-        text = build_main_text(data, habits)
+        kb = build_calendar(year, month, data, habits_full)
+        text = build_main_text(data, habits_full)
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
 @bot.message_handler(func=lambda message: True)
@@ -528,28 +622,50 @@ def handle_text(message):
     добавляем её в кэш и показываем главный экран.
     """
     if user_states.get(message.from_user.id) == "waiting_habit":
-        habits = data_cache.get_habits()
-        new_id = str(len(habits) + 1)
+        habits_full = data_cache.get_habits_full()
+        new_id = str(len(habits_full) + 1)
+        
+        # Парсим сообщение в формате "привычка/дата" или просто "привычка"
+        text_parts = message.text.strip().split("/")
+        habit_name = text_parts[0].strip()
+        
+        if len(text_parts) == 2:
+            # Пользователь указал дату
+            date_str = text_parts[1].strip()
+            try:
+                # Парсим дату в формате dd.mm.yyyy
+                parsed_date = datetime.datetime.strptime(date_str, "%d.%m.%Y").date()
+                start_date = parsed_date.strftime("%Y%m%d")
+            except ValueError:
+                bot.send_message(message.chat.id, "❌ Неверный формат даты! Используйте формат: привычка/дд.мм.гггг\nНапример: Читать книги/21.09.2025")
+                return
+        else:
+            # Если дата не указана, используем сегодняшнюю дату
+            start_date = datetime.date.today().strftime("%Y%m%d")
         
         # Логируем добавление новой привычки
-        logger.info(f"Пользователь {message.from_user.id} добавил новую привычку: '{message.text.strip()}' (ID: {new_id})")
+        logger.info(f"Пользователь {message.from_user.id} добавил новую привычку: '{habit_name}' с датой начала {start_date} (ID: {new_id})")
         
         # Добавляем привычку в кэш
-        data_cache.add_habit(new_id, message.text.strip())
+        data_cache.add_habit(new_id, habit_name, start_date)
         
         user_states.pop(message.from_user.id)
 
         data = data_cache.get_stats()
+        habits_full = data_cache.get_habits_full()
         now = datetime.date.today()
-        kb = build_calendar(now.year, now.month, data, habits)
-        text = build_main_text(data, habits)
-        bot.send_message(message.chat.id, f"Привычка «{message.text}» добавлена!", reply_markup=kb)
+        kb = build_calendar(now.year, now.month, data, habits_full)
+        text = build_main_text(data, habits_full)
+        bot.send_message(message.chat.id, f"Привычка «{habit_name}» добавлена!", reply_markup=kb)
 
 # Инициализация при запуске
 if __name__ == "__main__":
     try:
         logger.info("Инициализация БД...")
         init_database()
+        
+        logger.info("Выполнение миграции БД...")
+        migrate_database()
         
         logger.info("Загрузка данных из БД...")
         data_cache.load_from_db()
