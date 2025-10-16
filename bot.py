@@ -96,6 +96,8 @@ def error_handler(func):
 
 # Нижняя граница дат, которые учитываются в интерфейсе и при подсчёте серий
 START_DATE = datetime.date(2025, 9, 27)
+# Количество дней для формирования устойчивой привычки (используется в отображении прогресса)
+SUCCESS_DAY_COUNT = 21
 
 # Кэш в памяти
 class DataCache:
@@ -306,11 +308,11 @@ def init_database():
 
 
 def calc_streaks(data, habits_full):
-    """Подсчитать лучшую/текущую/прерванную серии по каждой привычке.
+    """Подсчитать лучшую/текущую серии по каждой привычке в стиле примера.
 
     data: {"YYYYMMDD": {habit_id: bool}}
     habits_full: {habit_id: {"name": str, "start_date": str}}
-    Возвращает: {habit_name: (best, current, broken_best)}
+    Возвращает: {habit_name: {"current": int, "best": int}}
     """
     results = {}
     today = datetime.date.today()
@@ -326,38 +328,27 @@ def calc_streaks(data, habits_full):
             # Если дата некорректная, используем START_DATE
             habit_start_date = START_DATE
         
-        best = 0
-        current = 0
-        broken_best = 0
-        streak = 0
-        last_date = None
-
-        for d in sorted(data.keys()):
-            date = datetime.datetime.strptime(d, "%Y%m%d").date()
-            # Учитываем только даты после начала привычки и до сегодня
-            if date < habit_start_date or date > today:
-                continue
-
-            if h_id in data[d] and data[d][h_id]:
-                if last_date is None or (date - last_date).days == 1:
-                    streak += 1
-                else:
-                    if streak > best:
-                        best = streak
-                    streak = 1
-                last_date = date
+        # Инициализируем streak для этой привычки
+        streaks = {"current": 0, "best": 0}
+        
+        # Проходим по всем датам от начала привычки до сегодня
+        current_date = habit_start_date
+        while current_date <= today:
+            date_str = current_date.strftime("%Y%m%d")
+            
+            # Проверяем статус привычки на эту дату
+            if date_str in data and h_id in data[date_str] and data[date_str][h_id]:
+                # Привычка выполнена
+                streaks["current"] += 1
+                if streaks["current"] > streaks["best"]:
+                    streaks["best"] = streaks["current"]
             else:
-                if streak > best:
-                    best = streak
-                if streak > broken_best:
-                    broken_best = streak
-                streak = 0
-                last_date = None
+                # Привычка не выполнена или дата отсутствует
+                streaks["current"] = 0
+            
+            current_date += datetime.timedelta(days=1)
 
-        if streak > best:
-            best = streak
-
-        results[habit_name] = (best, streak, broken_best)
+        results[habit_name] = streaks
 
     return results
 
@@ -393,11 +384,11 @@ def day_status_emoji(date_str, data, habits_full):
         return ""
 
     if is_week_gold(date, data, habits_full):
-        return " ⭐"
+        return "⭐"
 
     if date_str not in data:
         if date < today:
-            return " 🔴"
+            return "🔴"
         return ""
     
     habits_data = data[date_str]
@@ -423,13 +414,13 @@ def day_status_emoji(date_str, data, habits_full):
         return ""
     elif done == 0:
         if date < today:
-            return " 🔴"
+            return "🔴"
         else:
             return ""
     elif done == total_active:
-        return " 🟢"
+        return "🟢"
     else:
-        return " 🟡"
+        return "🟡"
 
 
 def build_calendar(year, month, data, habits_full):
@@ -438,9 +429,16 @@ def build_calendar(year, month, data, habits_full):
     cal = calendar.Calendar(firstweekday=0)
     month_days = cal.monthdayscalendar(year, month)
 
-    kb.add(InlineKeyboardButton(f"{calendar.month_name[month]} {year}", callback_data="none"))
+    # Русские названия месяцев и дней недели
+    MONTHS_RU = [
+        "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
+    ]
+    DAYS_RU = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
 
-    days_row = [InlineKeyboardButton(d, callback_data="none") for d in ["Mo","Tu","We","Th","Fr","Sa","Su"]]
+    kb.add(InlineKeyboardButton(f"{MONTHS_RU[month]} {year}", callback_data="none"))
+
+    days_row = [InlineKeyboardButton(d, callback_data="none") for d in DAYS_RU]
     kb.row(*days_row)
 
     for week in month_days:
@@ -494,12 +492,41 @@ def build_main_text(data, habits_full):
     """Текст главного экрана с лучшими результатами по привычкам."""
     streaks = calc_streaks(data, habits_full)
     lines = ["Лучшие результаты:\n"]
-    for habit, (best, current, broken) in streaks.items():
-        if broken and broken != best:
-            lines.append(f"{habit} — {best} дней (был {broken})")
+    for habit, streak_data in streaks.items():
+        current = streak_data["current"]
+        best = streak_data["best"]
+        
+        if current > 0:
+            # Есть текущая серия
+            #🏅🏆
+            if current == best:
+                # Текущая серия равна лучшей (новый рекорд или продолжение рекорда)
+                if current < SUCCESS_DAY_COUNT:
+                    lines.append(f"🔘 {habit} — {current}/{SUCCESS_DAY_COUNT} дн. ({round(current/SUCCESS_DAY_COUNT*100)}%)")
+                else:
+                    lines.append(f"🔥 {habit} — {current} дн.")
+            else:
+                # Текущая серия меньше лучшей
+                if current < SUCCESS_DAY_COUNT:
+                    lines.append(f"🔘 {habit} — {current}/{SUCCESS_DAY_COUNT} дн. ({round(current/SUCCESS_DAY_COUNT*100)}%) 🏆: {best} дн.")
+                    #lines.append(f"{habit} — ✅ {current}/{SUCCESS_DAY_COUNT} дней ({round(current/SUCCESS_DAY_COUNT*100)}%) (лучший {best})")
+                else:
+                    lines.append(f"🔘 {habit} — ✅ {current} дней (🏆 {best})")
+                    #lines.append(f"{habit} — ✅ {current} дней (лучший {best})")
         else:
-            lines.append(f"{habit} — {best}/21 дней ({round(best/21*100)}%)")
-    lines.append("\nВыбери день:")
+            # Нет текущей серии
+            if best > 0:
+                #if best < SUCCESS_DAY_COUNT:
+                #    lines.append(f"{habit} — ❌ серия прервана (лучший {best}/{SUCCESS_DAY_COUNT} дней, {round(best/SUCCESS_DAY_COUNT*100)}%)")
+                #else:
+                #    lines.append(f"{habit} — ❌ серия прервана (лучший {best})")
+                lines.append(f"❌ {habit} — серия прервана. 🏆: {best} дн.")
+                #lines.append(f"{habit} — серия прервана (лучший {best})")
+            else:
+                lines.append(f"🔘 {habit} — пока нет результатов")
+            
+    lines.append(" ")
+    #lines.append("\nВыбери день:")
     return "\n".join(lines)
 
 
@@ -589,12 +616,18 @@ def callback_handler(call):
         status_text = "выполнено" if new_status else "не выполнено"
         logger.info(f"Пользователь {call.from_user.id} изменил статус '{habit_name}' на {date_str[6:]}.{date_str[4:6]}.{date_str[:4]} - {status_text}")
         
+        # Получаем streak данные до изменения
+        old_streaks = calc_streaks(data, habits_full)
+        old_current = old_streaks.get(habit_name, {}).get("current", 0)
+        old_best = old_streaks.get(habit_name, {}).get("best", 0)
+        
         # Обновляем в кэше
         data_cache.update_stat(date_str, habit_id, new_status)
         
         # Обновляем локальную копию для отображения
         data = data_cache.get_stats()
-        # Сохраняем единый формат даты dd.mm.yyyy
+        
+        # Обновляем только текст заголовка дня без сообщений о серии
         text = f"Статус привычек за {date_str[6:]}.{date_str[4:6]}.{date_str[:4]}"
         kb = build_day_menu(date_str, data, habits_full)
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
