@@ -491,7 +491,9 @@ def build_day_menu(date_str, data, habits_full):
 def build_main_text(data, habits_full):
     """Текст главного экрана с лучшими результатами по привычкам."""
     streaks = calc_streaks(data, habits_full)
-    lines = ["Лучшие результаты:\n"]
+    #NBSP = "\u00A0"
+    #lines = [f"Лучшие результаты:{NBSP*50}ф\n"]          1
+    lines = [f"-----------Лучшие результаты:-----------\n"]
     for habit, streak_data in streaks.items():
         current = streak_data["current"]
         best = streak_data["best"]
