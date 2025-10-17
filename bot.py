@@ -262,7 +262,6 @@ def migrate_database():
         logger.error(f"Ошибка миграции БД: {str(e)}")
         logger.error(f"Трассировка: {traceback.format_exc()}")
 
-
 def init_database():
     """Создание таблиц в БД (PostgreSQL диалект).
 
@@ -306,9 +305,8 @@ def init_database():
         logger.error(f"Ошибка инициализации БД: {str(e)}")
         logger.error(f"Трассировка: {traceback.format_exc()}")
 
-
 def calc_streaks(data, habits_full):
-    """Подсчитать лучшую/текущую серии по каждой привычке в стиле примера.
+    """Подсчитать лучшую/текущую серии по каждой привычке.
 
     data: {"YYYYMMDD": {habit_id: bool}}
     habits_full: {habit_id: {"name": str, "start_date": str}}
@@ -316,6 +314,7 @@ def calc_streaks(data, habits_full):
     """
     results = {}
     today = datetime.date.today()
+    today_str = today.strftime("%Y%m%d")
 
     for h_id, habit_data in habits_full.items():
         habit_name = habit_data["name"]
@@ -325,37 +324,42 @@ def calc_streaks(data, habits_full):
         try:
             habit_start_date = datetime.datetime.strptime(start_date_str, "%Y%m%d").date()
         except ValueError:
-            # Если дата некорректная, используем START_DATE
             habit_start_date = START_DATE
         
         # Инициализируем streak для этой привычки
         streaks = {"current": 0, "best": 0}
+        current_streak = 0
+        max_streak = 0
         
-        # Проходим по всем датам от начала привычки до сегодня
+        # Проходим по всем датам от начала привычки до вчера
         current_date = habit_start_date
-        while current_date <= today:
+        while current_date < today:
             date_str = current_date.strftime("%Y%m%d")
             
             # Проверяем статус привычки на эту дату
             if date_str in data and h_id in data[date_str] and data[date_str][h_id]:
-                # Привычка выполнена
-                streaks["current"] += 1
-                if streaks["current"] > streaks["best"]:
-                    streaks["best"] = streaks["current"]
+                current_streak += 1
+                if current_streak > max_streak:
+                    max_streak = current_streak
             else:
-                # Привычка не выполнена или дата отсутствует
-                streaks["current"] = 0
+                current_streak = 0
             
             current_date += datetime.timedelta(days=1)
-
+        
+        # Для текущего дня проверяем статус отдельно
+        if today_str in data and h_id in data[today_str] and data[today_str][h_id]:
+            current_streak += 1
+            if current_streak > max_streak:
+                max_streak = current_streak
+        
+        streaks["current"] = current_streak
+        streaks["best"] = max_streak
         results[habit_name] = streaks
 
     return results
 
-
 def is_week_gold(date, data, habits_full):
     """Проверяет «золотую неделю»: все привычки выполнены каждый день недели."""
-    # проверяем всю неделю: если все привычки выполнены каждый день
     monday = date - datetime.timedelta(days=date.weekday())
     sunday = monday + datetime.timedelta(days=6)
 
@@ -364,13 +368,11 @@ def is_week_gold(date, data, habits_full):
         if d_str not in data:
             return False
         for h_id, habit_data in habits_full.items():
-            # Проверяем только привычки, которые уже начались к этому дню
             try:
                 habit_start_date = datetime.datetime.strptime(habit_data["start_date"], "%Y%m%d").date()
                 if d >= habit_start_date and not data[d_str].get(h_id, False):
                     return False
             except ValueError:
-                # Если дата некорректная, используем START_DATE
                 if d >= START_DATE and not data[d_str].get(h_id, False):
                     return False
     return True
@@ -396,7 +398,6 @@ def day_status_emoji(date_str, data, habits_full):
     total_active = 0
     
     for h_id, habit_data in habits_full.items():
-        # Проверяем только привычки, которые уже начались к этому дню
         try:
             habit_start_date = datetime.datetime.strptime(habit_data["start_date"], "%Y%m%d").date()
             if date >= habit_start_date:
@@ -404,7 +405,6 @@ def day_status_emoji(date_str, data, habits_full):
                 if habits_data.get(h_id, False):
                     done += 1
         except ValueError:
-            # Если дата некорректная, используем START_DATE
             if date >= START_DATE:
                 total_active += 1
                 if habits_data.get(h_id, False):
@@ -422,14 +422,12 @@ def day_status_emoji(date_str, data, habits_full):
     else:
         return "🟡"
 
-
 def build_calendar(year, month, data, habits_full):
     """Построение инлайн-календаря с днями и навигацией по месяцам."""
     kb = InlineKeyboardMarkup(row_width=7)
     cal = calendar.Calendar(firstweekday=0)
     month_days = cal.monthdayscalendar(year, month)
 
-    # Русские названия месяцев и дней недели
     MONTHS_RU = [
         "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
         "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
@@ -471,7 +469,6 @@ def build_day_menu(date_str, data, habits_full):
     
     for h_id, habit_data in habits_full.items():
         habit_name = habit_data["name"]
-        # Проверяем только привычки, которые уже начались к этому дню
         try:
             habit_start_date = datetime.datetime.strptime(habit_data["start_date"], "%Y%m%d").date()
             if date >= habit_start_date:
@@ -479,7 +476,6 @@ def build_day_menu(date_str, data, habits_full):
                 cb = f"toggle_{date_str}_{h_id}"
                 kb.add(InlineKeyboardButton(f"{status} {habit_name}", callback_data=cb))
         except ValueError:
-            # Если дата некорректная, используем START_DATE
             if date >= START_DATE:
                 status = "✅" if habits_data.get(h_id, False) else ""
                 cb = f"toggle_{date_str}_{h_id}"
@@ -491,46 +487,52 @@ def build_day_menu(date_str, data, habits_full):
 def build_main_text(data, habits_full):
     """Текст главного экрана с лучшими результатами по привычкам."""
     streaks = calc_streaks(data, habits_full)
-    #NBSP = "\u00A0"
-    #lines = [f"Лучшие результаты:{NBSP*50}ф\n"]          1
+    today = datetime.date.today()
+    today_str = today.strftime("%Y%m%d")
     lines = [f"-----------Лучшие результаты:-----------\n"]
+    
     for habit, streak_data in streaks.items():
         current = streak_data["current"]
         best = streak_data["best"]
         
-        if current > 0:
-            # Есть текущая серия
-            #🏅🏆
+        # Проверяем, есть ли статус за сегодня
+        today_status_exists = today_str in data and any(h_id in data[today_str] for h_id, h_data in habits_full.items() if h_data["name"] == habit)
+        today_status = False
+        if today_status_exists:
+            for h_id, h_data in habits_full.items():
+                if h_data["name"] == habit and h_id in data[today_str]:
+                    today_status = data[today_str][h_id]
+                    break
+        
+        if current > 0 or (today_status_exists and today_status):
+            # Есть текущая серия (включая случай, если сегодня отмечено)
             if current == best:
-                # Текущая серия равна лучшей (новый рекорд или продолжение рекорда)
                 if current < SUCCESS_DAY_COUNT:
                     lines.append(f"🔘 {habit} — {current}/{SUCCESS_DAY_COUNT} дн. ({round(current/SUCCESS_DAY_COUNT*100)}%)")
                 else:
                     lines.append(f"🔥 {habit} — {current} дн.")
             else:
-                # Текущая серия меньше лучшей
                 if current < SUCCESS_DAY_COUNT:
                     lines.append(f"🔘 {habit} — {current}/{SUCCESS_DAY_COUNT} дн. ({round(current/SUCCESS_DAY_COUNT*100)}%) 🏆: {best} дн.")
-                    #lines.append(f"{habit} — ✅ {current}/{SUCCESS_DAY_COUNT} дней ({round(current/SUCCESS_DAY_COUNT*100)}%) (лучший {best})")
                 else:
                     lines.append(f"🔘 {habit} — ✅ {current} дней (🏆 {best})")
-                    #lines.append(f"{habit} — ✅ {current} дней (лучший {best})")
         else:
             # Нет текущей серии
-            if best > 0:
-                #if best < SUCCESS_DAY_COUNT:
-                #    lines.append(f"{habit} — ❌ серия прервана (лучший {best}/{SUCCESS_DAY_COUNT} дней, {round(best/SUCCESS_DAY_COUNT*100)}%)")
-                #else:
-                #    lines.append(f"{habit} — ❌ серия прервана (лучший {best})")
-                lines.append(f"❌ {habit} — серия прервана. 🏆: {best} дн.")
-                #lines.append(f"{habit} — серия прервана (лучший {best})")
+            if today_status_exists and not today_status:
+                # Сегодня отмечено как невыполненное
+                if best > 0:
+                    lines.append(f"❌ {habit} — серия прервана. 🏆: {best} дн.")
+                else:
+                    lines.append(f"🔘 {habit} — пока нет результатов")
             else:
-                lines.append(f"🔘 {habit} — пока нет результатов")
-            
+                # Сегодня ещё не отмечено
+                if best > 0:
+                    lines.append(f"🔘 {habit} — сегодня ещё не отмечено. 🏆: {best} дн.")
+                else:
+                    lines.append(f"🔘 {habit} — сегодня ещё не отмечено")
+    
     lines.append(" ")
-    #lines.append("\nВыбери день:")
     return "\n".join(lines)
-
 
 user_states = {}  # хранение состояния пользователей
 
@@ -566,7 +568,6 @@ def force_upload(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка загрузки: {e}")
 
-
 @bot.message_handler(commands=["reload"])
 @error_handler
 def reload_cache(message):
@@ -586,7 +587,6 @@ def reload_cache(message):
         
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка перезагрузки: {e}")
-
 
 @bot.callback_query_handler(func=lambda call: True)
 @error_handler
@@ -618,18 +618,13 @@ def callback_handler(call):
         status_text = "выполнено" if new_status else "не выполнено"
         logger.info(f"Пользователь {call.from_user.id} изменил статус '{habit_name}' на {date_str[6:]}.{date_str[4:6]}.{date_str[:4]} - {status_text}")
         
-        # Получаем streak данные до изменения
-        old_streaks = calc_streaks(data, habits_full)
-        old_current = old_streaks.get(habit_name, {}).get("current", 0)
-        old_best = old_streaks.get(habit_name, {}).get("best", 0)
-        
         # Обновляем в кэше
         data_cache.update_stat(date_str, habit_id, new_status)
         
         # Обновляем локальную копию для отображения
         data = data_cache.get_stats()
         
-        # Обновляем только текст заголовка дня без сообщений о серии
+        # Обновляем текст и меню
         text = f"Статус привычек за {date_str[6:]}.{date_str[4:6]}.{date_str[:4]}"
         kb = build_day_menu(date_str, data, habits_full)
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
@@ -668,14 +663,12 @@ def handle_text(message):
             # Пользователь указал дату
             date_str = text_parts[1].strip()
             try:
-                # Парсим дату в формате dd.mm.yyyy
                 parsed_date = datetime.datetime.strptime(date_str, "%d.%m.%Y").date()
                 start_date = parsed_date.strftime("%Y%m%d")
             except ValueError:
                 bot.send_message(message.chat.id, "❌ Неверный формат даты! Используйте формат: привычка/дд.мм.гггг\nНапример: Читать книги/21.09.2025")
                 return
         else:
-            # Если дата не указана, используем сегодняшнюю дату
             start_date = datetime.date.today().strftime("%Y%m%d")
         
         # Логируем добавление новой привычки
