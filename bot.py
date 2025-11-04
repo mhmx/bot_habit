@@ -24,32 +24,43 @@ from logging.handlers import RotatingFileHandler
 from typing import Dict, Any
 from config import TOKEN, DB_CONFIG
 
+# Флаг для включения/выключения логирования
+ENABLE_LOGGING = False  # Поставьте False чтобы отключить логирование
+
 # Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),  # Вывод в консоль
-        RotatingFileHandler('bot.log', maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')  # Ротация логов
-    ]
-)
+if ENABLE_LOGGING:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),  # Вывод в консоль
+            RotatingFileHandler('bot.log', maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')  # Ротация логов
+        ]
+    )
+else:
+    # Если логирование отключено, настраиваем "пустой" логгер
+    logging.basicConfig(level=logging.CRITICAL, handlers=[logging.NullHandler()])
+
 logger = logging.getLogger(__name__)
 
-# Подавляем подробные логи от telebot для ошибки 409
-telebot_logger = logging.getLogger('telebot')
-telebot_logger.setLevel(logging.WARNING)
+# Если логирование отключено, подавляем все логи telebot
+if not ENABLE_LOGGING:
+    telebot_logger = logging.getLogger('telebot')
+    telebot_logger.setLevel(logging.CRITICAL)
+    telebot_logger.propagate = False
+else:
+    telebot_logger = logging.getLogger('telebot')
+    telebot_logger.setLevel(logging.WARNING)
+    # Фильтр для подавления повторяющихся ошибок 409
+    class Error409Filter(logging.Filter):
+        def filter(self, record):
+            if hasattr(record, 'msg') and isinstance(record.msg, str):
+                if "Error code: 409" in record.msg and "Conflict: terminated by other getUpdates request" in record.msg:
+                    return False
+            return True
+    telebot_logger.addFilter(Error409Filter())
 
-# Фильтр для подавления повторяющихся ошибок 409
-class Error409Filter(logging.Filter):
-    def filter(self, record):
-        if hasattr(record, 'msg') and isinstance(record.msg, str):
-            if "Error code: 409" in record.msg and "Conflict: terminated by other getUpdates request" in record.msg:
-                return False
-        return True
-
-# Применяем фильтр к логгеру telebot
-telebot_logger.addFilter(Error409Filter())
-
+# Остальной код без изменений...
 bot = telebot.TeleBot(TOKEN)
 
 # Кастомный обработчик исключений для telebot
@@ -61,6 +72,9 @@ class CustomExceptionHandler:
     
     def handle(self, exception):
         """Обработка исключения"""
+        if not ENABLE_LOGGING:
+            return True
+            
         error_msg = str(exception)
         current_time = time.time()
         
@@ -84,13 +98,14 @@ def error_handler(func):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            error_msg = str(e)
-            # Краткое сообщение для ошибки 409 (конфликт экземпляров бота)
-            if "Error code: 409" in error_msg and "Conflict: terminated by other getUpdates request" in error_msg:
-                logger.error("Ошибка 409: Запущено несколько экземпляров бота одновременно")
-            else:
-                logger.error(f"Ошибка в {func.__name__}: {error_msg}")
-                logger.error(f"Трассировка: {traceback.format_exc()}")
+            if ENABLE_LOGGING:
+                error_msg = str(e)
+                # Краткое сообщение для ошибки 409 (конфликт экземпляров бота)
+                if "Error code: 409" in error_msg and "Conflict: terminated by other getUpdates request" in error_msg:
+                    logger.error("Ошибка 409: Запущено несколько экземпляров бота одновременно")
+                else:
+                    logger.error(f"Ошибка в {func.__name__}: {error_msg}")
+                    logger.error(f"Трассировка: {traceback.format_exc()}")
             return None
     return wrapper
 
@@ -378,7 +393,7 @@ def is_week_gold(date, data, habits_full):
     return True
 
 def day_status_emoji(date_str, data, habits_full):
-    """Возвращает эмодзи статуса для дня (⭐/🔴/🟡/🟢)."""
+    """Возвращает эмодзи статуса для дня (⭐/🔴/🟡/🟢/🔵)."""
     today = datetime.date.today()
     date = datetime.datetime.strptime(date_str, "%Y%m%d").date()
 
@@ -392,11 +407,11 @@ def day_status_emoji(date_str, data, habits_full):
         if date < today:
             return "🔴"
         return ""
-    
+
     habits_data = data[date_str]
     done = 0
     total_active = 0
-    
+
     for h_id, habit_data in habits_full.items():
         try:
             habit_start_date = datetime.datetime.strptime(habit_data["start_date"], "%Y%m%d").date()
@@ -409,18 +424,31 @@ def day_status_emoji(date_str, data, habits_full):
                 total_active += 1
                 if habits_data.get(h_id, False):
                     done += 1
-    
+
     if total_active == 0:
         return ""
-    elif done == 0:
+
+    # Все выполнено
+    if done == total_active:
+        return "🟢"
+
+    # Ничего не выполнено
+    if done == 0:
         if date < today:
             return "🔴"
+        elif date == today:
+            return "📍"  # сегодня, но пока ничего не сделано
         else:
             return ""
-    elif done == total_active:
-        return "🟢"
+
+    # Частично выполнено
+    if date < today:
+        return "🟡"  # прошедший день, не всё выполнено
+    elif date == today:
+        return "📍"  # сегодня, день ещё идёт
     else:
-        return "🟡"
+        return ""
+
 
 def build_calendar(year, month, data, habits_full):
     """Построение инлайн-календаря с днями и навигацией по месяцам."""
